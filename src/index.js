@@ -21,8 +21,15 @@ const CATEGORIAS_POR_TEMA = {
   divertido: ['Personagem de desenho', 'Comida estranha', 'Palavra difícil', 'Nome de cachorro', 'Sobrenome', 'Bebida', 'País', 'Esporte'],
   geografia: ['País', 'Cidade', 'Rio', 'Montanha', 'Ilha', 'Capital', 'Estado brasileiro', 'Continente'],
   cultura: ['Filme', 'Série', 'Música', 'Artista', 'Livro', 'Jogo', 'YouTuber', 'Marca'],
-  custom: [] // preenchido pelo criador da sala
+  custom: []
 };
+
+const CATEGORIAS_POOL = [...new Set([].concat(...Object.values(CATEGORIAS_POR_TEMA).filter(Array.isArray)))];
+
+function pickRandomCategorias(quantidade) {
+  const shuffled = [...CATEGORIAS_POOL].sort(() => Math.random() - 0.5);
+  return shuffled.slice(0, Math.min(quantidade, shuffled.length));
+}
 
 const PONTOS = { invalido: 0, repetido: 5, soVoce: 10 };
 const MOEDAS_VITORIA = 50;
@@ -33,9 +40,14 @@ const TEMPO_POR_MODO = { classico: 90, velocidade_maxima: 60, proxima_voce: 90, 
 
 function createRoom(id, hostId, options = {}) {
   const modo = options.modo || 'classico';
-  const categorias = (options.categorias && options.categorias.length > 0)
-    ? options.categorias
-    : [...(CATEGORIAS_POR_TEMA[options.tema] || CATEGORIAS_POR_TEMA.classico)];
+  let categorias;
+  if (options.categorias && options.categorias.length > 0) {
+    categorias = options.categorias;
+  } else if (options.categoriasAleatorio && options.quantidadeCategorias > 0) {
+    categorias = pickRandomCategorias(Math.min(20, Math.max(5, options.quantidadeCategorias)));
+  } else {
+    categorias = [...CATEGORIAS_POR_TEMA.classico];
+  }
   return {
     id,
     hostId,
@@ -203,7 +215,7 @@ io.on('connection', (socket) => {
     socket.emit('user:ok', { userId, name: u.name, coins: u.coins });
   });
 
-  socket.on('room:create', ({ name, password, tema, categorias, maxRodadas, maxJogadores, modo }) => {
+  socket.on('room:create', ({ name, password, tema, categorias, categoriasAleatorio, quantidadeCategorias, maxRodadas, maxJogadores, modo }) => {
     const roomId = uuidv4().slice(0, 8);
     const hostId = socket.userId || uuidv4();
     getOrCreateUser(hostId, socket.userName);
@@ -212,6 +224,8 @@ io.on('connection', (socket) => {
       password: password || null,
       tema: tema || 'classico',
       categorias: categorias && categorias.length ? categorias : null,
+      categoriasAleatorio: !!categoriasAleatorio,
+      quantidadeCategorias: quantidadeCategorias || 8,
       maxRodadas: maxRodadas || 5,
       maxJogadores: maxJogadores || 8,
       modo: modo || 'classico'
@@ -339,6 +353,36 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('room:prontos', { prontos, total, minimo, podeStop: prontos >= minimo });
   });
 
+  socket.on('game:cancelar_resposta', ({ categoria }) => {
+    const roomId = socket.roomId;
+    const room = rooms.get(roomId);
+    if (!room || room.estado !== 'resultado' || !room.pontosAntesRodada) return;
+    if (!categoria || !room.categorias.includes(categoria)) return;
+    const j = room.jogadores.get(socket.id);
+    if (!j) return;
+    j.respostas[categoria] = '';
+    const jogadores = [...room.jogadores.entries()];
+    const pts = calcularPontos(jogadores, room.categorias, room.letra);
+    const bySocket = {};
+    const respostasPorJogador = {};
+    for (const [sid, jo] of jogadores) {
+      const pd = pts[jo.userId] || { total: 0, detalhe: {} };
+      const antes = room.pontosAntesRodada.get(sid) ?? jo.pontos;
+      jo.pontos = antes + pd.total;
+      bySocket[sid] = { total: pd.total, detalhe: pd.detalhe, acumulado: jo.pontos };
+      respostasPorJogador[sid] = { name: jo.name, userId: jo.userId, respostas: jo.respostas || {} };
+    }
+    io.to(roomId).emit('game:resultado', {
+      letra: room.letra,
+      categorias: room.categorias,
+      pontuacao: bySocket,
+      respostasPorJogador,
+      jogadores: jogadores.map(([sid, jo]) => ({ socketId: sid, name: jo.name, userId: jo.userId, pontos: jo.pontos })),
+      eliminadosEstaRodada: room.eliminadosEstaRodadaSnapshot || undefined,
+      modo: room.modo
+    });
+  });
+
   socket.on('game:stop', () => {
     const roomId = socket.roomId;
     const room = rooms.get(roomId);
@@ -385,6 +429,7 @@ function roundEnd(roomId, io) {
   if (!room) return;
   room.estado = 'resultado';
   const jogadores = [...room.jogadores.entries()];
+  room.pontosAntesRodada = new Map(jogadores.map(([sid, j]) => [sid, j.pontos]));
   const pts = calcularPontos(jogadores, room.categorias, room.letra);
   const bySocket = {};
   const respostasPorJogador = {};
@@ -408,13 +453,14 @@ function roundEnd(roomId, io) {
     }
   }
 
+  room.eliminadosEstaRodadaSnapshot = room.modo === 'ficando_para_tras' ? eliminadosEstaRodada : undefined;
   io.to(roomId).emit('game:resultado', {
     letra: room.letra,
     categorias: room.categorias,
     pontuacao: bySocket,
     respostasPorJogador,
     jogadores: [...room.jogadores.entries()].map(([sid, j]) => ({ socketId: sid, name: j.name, userId: j.userId, pontos: j.pontos })),
-    eliminadosEstaRodada: room.modo === 'ficando_para_tras' ? eliminadosEstaRodada : undefined,
+    eliminadosEstaRodada: room.eliminadosEstaRodadaSnapshot,
     modo: room.modo
   });
 

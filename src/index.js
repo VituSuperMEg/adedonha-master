@@ -104,34 +104,65 @@ function comecaComLetra(resp, letra) {
   return (resp.trim().toUpperCase()[0] || '') === String(letra).toUpperCase()[0];
 }
 
-function calcularPontos(jogadores, categorias, letra) {
-  const letraUpper = String(letra || '').toUpperCase()[0] || '';
-  const contagem = {};
-  for (const [, data] of jogadores) {
-    const jid = data.userId;
-    for (const [cat, resp] of Object.entries(data.respostas || {})) {
-      if (!comecaComLetra(resp, letraUpper)) continue;
-      const key = `${cat}:${(resp || '').trim().toLowerCase()}`;
-      if (!contagem[key]) contagem[key] = new Set();
-      if (resp && resp.trim()) contagem[key].add(jid);
+function levenshtein(a, b) {
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  const matrix = [];
+  for (let i = 0; i <= b.length; i++) matrix[i] = [i];
+  for (let j = 0; j <= a.length; j++) matrix[0][j] = j;
+  for (let i = 1; i <= b.length; i++) {
+    for (let j = 1; j <= a.length; j++) {
+      if (b[i - 1] === a[j - 1]) matrix[i][j] = matrix[i - 1][j - 1];
+      else matrix[i][j] = 1 + Math.min(matrix[i - 1][j - 1], matrix[i][j - 1], matrix[i - 1][j]);
     }
   }
+  return matrix[b.length][a.length];
+}
+
+/** Duas respostas contam como "mesma" se: iguais, uma contém a outra (compostas), ou typo (Levenshtein <= 1). */
+function respostasEquivalentes(a, b) {
+  const na = (a || '').trim().toLowerCase();
+  const nb = (b || '').trim().toLowerCase();
+  if (!na || !nb) return na === nb;
+  if (na === nb) return true;
+  if (na.includes(nb) || nb.includes(na)) return true; // Raimundo vs Raimundo Oliveira → 5 pts
+  const maxDist = na.length <= 8 ? 1 : 2; // 1 typo em palavras curtas, 2 em longas
+  return levenshtein(na, nb) <= maxDist; // macaco vs macocu → 5 pts
+}
+
+function calcularPontos(jogadores, categorias, letra) {
+  const letraUpper = String(letra || '').toUpperCase()[0] || '';
+  const jogadoresArr = [...jogadores.entries()];
+
+  // Por categoria: agrupar respostas equivalentes (igualdade, composta, typo)
+  const gruposPorCat = {};
+  for (const cat of categorias) {
+    gruposPorCat[cat] = [];
+    for (const [, data] of jogadoresArr) {
+      const resp = (data.respostas && data.respostas[cat]) || '';
+      if (!resp || !resp.trim() || !comecaComLetra(resp, letraUpper)) continue;
+      const jid = data.userId;
+      let grupo = gruposPorCat[cat].find((g) => g.respostas.some((r) => respostasEquivalentes(r.resp, resp)));
+      if (grupo) {
+        grupo.userIds.add(jid);
+        grupo.respostas.push({ userId: jid, resp });
+      } else {
+        gruposPorCat[cat].push({ userIds: new Set([jid]), respostas: [{ userId: jid, resp }] });
+      }
+    }
+  }
+
   const pontosPorJogador = {};
-  for (const [, data] of jogadores) {
+  for (const [, data] of jogadoresArr) {
     const jid = data.userId;
     pontosPorJogador[jid] = { total: 0, detalhe: {} };
     for (const cat of categorias) {
       const resp = (data.respostas && data.respostas[cat]) || '';
       let pts = PONTOS.invalido;
-      if (resp && resp.trim()) {
-        if (!comecaComLetra(resp, letraUpper)) {
-          pts = PONTOS.invalido;
-        } else {
-          const key = `${cat}:${(resp || '').trim().toLowerCase()}`;
-          const quem = contagem[key];
-          if (!quem || quem.size === 0) pts = PONTOS.invalido;
-          else if (quem.size === 1) pts = PONTOS.soVoce;
-          else pts = PONTOS.repetido;
+      if (resp && resp.trim() && comecaComLetra(resp, letraUpper)) {
+        const grupo = gruposPorCat[cat].find((g) => g.userIds.has(jid));
+        if (grupo) {
+          pts = grupo.userIds.size === 1 ? PONTOS.soVoce : PONTOS.repetido;
         }
       }
       pontosPorJogador[jid].total += pts;

@@ -63,7 +63,7 @@ function createRoom(id, hostId, options = {}) {
     timerRef: null,
     rodadaAtual: 0,
     maxRodadas: options.maxRodadas || 5,
-    maxJogadores: Math.min(16, Math.max(2, options.maxJogadores || 8)),
+    maxJogadores: Math.min(100, Math.max(2, options.maxJogadores || 8)),
     tempoRodada: TEMPO_POR_MODO[modo] ?? 90,
     aguardandoLetra: false,
     eliminados: [],
@@ -464,74 +464,111 @@ function roundEnd(roomId, io) {
     modo: room.modo
   });
 
-  setTimeout(() => {
-    if (!rooms.has(roomId)) return;
-    const r = rooms.get(roomId);
+  const categorias = room.categorias || [];
+  const TEMPO_POR_CATEGORIA_MS = 20000;
+  const TEMPO_ANTES_PROXIMA_MS = 8000;
 
-    if (r.modo === 'ficando_para_tras' && r.jogadores.size <= 1) {
-      const winner = r.jogadores.values().next().value;
-      const ranking = winner
-        ? [{ userId: winner.userId, name: winner.name, pontos: winner.pontos }]
-        : [];
-      const rankReversed = [...(r.eliminados || [])].reverse();
-      ranking.push(...rankReversed.map((e) => ({ userId: e.userId, name: e.name, pontos: e.pontos })));
-      if (winner) {
-        const u = users.get(winner.userId);
-        if (u) u.coins += MOEDAS_VITORIA;
-        rankReversed.forEach((j) => {
-          const uu = users.get(j.userId);
-          if (uu) uu.coins += MOEDAS_PARTICIPACAO;
+  if (categorias.length === 0) {
+    setTimeout(() => doNextRound(roomId, io), TEMPO_ANTES_PROXIMA_MS);
+    return;
+  }
+
+  room.revisaoCategoriaIndex = 0;
+  if (room.revisaoTimerRef) clearTimeout(room.revisaoTimerRef);
+  room.revisaoTimerRef = setTimeout(() => revisaoAvancar(roomId, io), TEMPO_POR_CATEGORIA_MS);
+}
+
+function revisaoAvancar(roomId, io) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  room.revisaoTimerRef = null;
+  const categorias = room.categorias || [];
+  const TEMPO_POR_CATEGORIA_MS = 20000;
+  const TEMPO_ANTES_PROXIMA_MS = 8000;
+
+  const ehUltima = room.revisaoCategoriaIndex >= categorias.length - 1;
+  if (ehUltima || categorias.length === 0) {
+    io.to(roomId).emit('game:revisao_fim');
+    if (room.revisaoFimTimeout) clearTimeout(room.revisaoFimTimeout);
+    room.revisaoFimTimeout = setTimeout(() => doNextRound(roomId, io), TEMPO_ANTES_PROXIMA_MS);
+    return;
+  }
+  room.revisaoCategoriaIndex += 1;
+  io.to(roomId).emit('game:avancar_categoria', { categoriaIndex: room.revisaoCategoriaIndex });
+  room.revisaoTimerRef = setTimeout(() => revisaoAvancar(roomId, io), TEMPO_POR_CATEGORIA_MS);
+}
+
+function doNextRound(roomId, io) {
+  if (!rooms.has(roomId)) return;
+  const r = rooms.get(roomId);
+  if (r.revisaoFimTimeout) {
+    clearTimeout(r.revisaoFimTimeout);
+    r.revisaoFimTimeout = null;
+  }
+
+  if (r.modo === 'ficando_para_tras' && r.jogadores.size <= 1) {
+    const winner = r.jogadores.values().next().value;
+    const ranking = winner
+      ? [{ userId: winner.userId, name: winner.name, pontos: winner.pontos }]
+      : [];
+    const rankReversed = [...(r.eliminados || [])].reverse();
+    ranking.push(...rankReversed.map((e) => ({ userId: e.userId, name: e.name, pontos: e.pontos })));
+    if (winner) {
+      const u = users.get(winner.userId);
+      if (u) u.coins += MOEDAS_VITORIA;
+      rankReversed.forEach((j) => {
+        const uu = users.get(j.userId);
+        if (uu) uu.coins += MOEDAS_PARTICIPACAO;
+      });
+    }
+    io.to(roomId).emit('game:fim', { ranking, modo: r.modo });
+    rooms.delete(roomId);
+    return;
+  }
+
+  if (r.rodadaAtual >= r.maxRodadas) {
+    const ranking = [...r.jogadores.entries()]
+      .map(([sid, j]) => ({ userId: j.userId, name: j.name, pontos: j.pontos }))
+      .sort((a, b) => b.pontos - a.pontos);
+    const vencedor = ranking[0];
+    if (vencedor) {
+      const u = users.get(vencedor.userId);
+      if (u) {
+        u.coins += MOEDAS_VITORIA;
+        ranking.forEach((j, i) => {
+          if (i > 0) {
+            const uu = users.get(j.userId);
+            if (uu) uu.coins += MOEDAS_PARTICIPACAO;
+          }
         });
       }
-      io.to(roomId).emit('game:fim', { ranking, modo: r.modo });
-      rooms.delete(roomId);
-      return;
     }
-
-    if (r.rodadaAtual >= r.maxRodadas) {
-      const ranking = [...r.jogadores.entries()]
-        .map(([sid, j]) => ({ userId: j.userId, name: j.name, pontos: j.pontos }))
-        .sort((a, b) => b.pontos - a.pontos);
-      const vencedor = ranking[0];
-      if (vencedor) {
-        const u = users.get(vencedor.userId);
-        if (u) {
-          u.coins += MOEDAS_VITORIA;
-          ranking.forEach((j, i) => {
-            if (i > 0) {
-              const uu = users.get(j.userId);
-              if (uu) uu.coins += MOEDAS_PARTICIPACAO;
-            }
-          });
-        }
-      }
-      io.to(roomId).emit('game:fim', { ranking, modo: r.modo });
-      rooms.delete(roomId);
-      return;
-    }
-    r.estado = 'rodando';
-    r.rodadaAtual++;
-    for (const j of r.jogadores.values()) j.respostas = {};
-    if (r.modo === 'proxima_voce') {
-      r.aguardandoLetra = true;
-      const ordem = [...r.jogadores.keys()];
-      const idx = (r.rodadaAtual - 1) % ordem.length;
-      r.escolhedorSocketId = ordem[idx];
-      const escolhedor = r.jogadores.get(r.escolhedorSocketId);
-      io.to(roomId).emit('game:escolher_letra', {
-        escolhedor: r.escolhedorSocketId,
-        escolhedorNome: escolhedor?.name,
-        categorias: r.categorias,
-        rodada: r.rodadaAtual,
-        modo: r.modo,
-        tempoRodada: r.tempoRodada
-      });
-    } else {
-      r.letra = nextLetter();
-      io.to(roomId).emit('game:proxima', { letra: r.letra, rodada: r.rodadaAtual, categorias: r.categorias, modo: r.modo, tempoRodada: r.tempoRodada });
-      startRoundTimer(roomId, r.tempoRodada, io, () => roundEnd(roomId, io));
-    }
-  }, 8000);
+    io.to(roomId).emit('game:fim', { ranking, modo: r.modo });
+    rooms.delete(roomId);
+    return;
+  }
+  r.estado = 'rodando';
+  r.rodadaAtual++;
+  for (const j of r.jogadores.values()) j.respostas = {};
+  if (r.modo === 'proxima_voce') {
+    r.aguardandoLetra = true;
+    const ordem = [...r.jogadores.keys()];
+    const idx = (r.rodadaAtual - 1) % ordem.length;
+    r.escolhedorSocketId = ordem[idx];
+    const escolhedor = r.jogadores.get(r.escolhedorSocketId);
+    io.to(roomId).emit('game:escolher_letra', {
+      escolhedor: r.escolhedorSocketId,
+      escolhedorNome: escolhedor?.name,
+      categorias: r.categorias,
+      rodada: r.rodadaAtual,
+      modo: r.modo,
+      tempoRodada: r.tempoRodada
+    });
+  } else {
+    r.letra = nextLetter();
+    io.to(roomId).emit('game:proxima', { letra: r.letra, rodada: r.rodadaAtual, categorias: r.categorias, modo: r.modo, tempoRodada: r.tempoRodada });
+    startRoundTimer(roomId, r.tempoRodada, io, () => roundEnd(roomId, io));
+  }
 }
 
 const PORT = process.env.PORT || 3001;
